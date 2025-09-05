@@ -196,3 +196,117 @@
           "bull"
           "bear"
         ))
+
+        (total-pool (+ (get bull-pool market-data) (get bear-pool market-data)))
+        (winning-pool (if price-increased
+          (get bull-pool market-data)
+          (get bear-pool market-data)
+        ))
+      )
+      ;; Verify user predicted correctly
+      (asserts! (is-eq (get price-direction stake-data) winning-direction)
+        ERR_INVALID_PREDICTION
+      )
+
+      (let (
+          (gross-rewards (/ (* (get stake-amount stake-data) total-pool) winning-pool))
+          (platform-fee (/ (* gross-rewards (var-get platform-fee-rate)) u10000))
+          (net-rewards (- gross-rewards platform-fee))
+        )
+        ;; Distribute rewards and fees
+        (try! (as-contract (stx-transfer? net-rewards (as-contract tx-sender) tx-sender)))
+        (try! (as-contract (stx-transfer? platform-fee (as-contract tx-sender) CONTRACT_OWNER)))
+
+        ;; Mark rewards as claimed
+        (map-set participant-stakes {
+          market-id: market-id,
+          participant: tx-sender,
+        }
+          (merge stake-data { rewards-claimed: true })
+        )
+
+        (ok net-rewards)
+      )
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS
+
+(define-read-only (get-market-details (market-id uint))
+  (map-get? prediction-markets market-id)
+)
+
+(define-read-only (get-participant-stake
+    (market-id uint)
+    (participant principal)
+  )
+  (map-get? participant-stakes {
+    market-id: market-id,
+    participant: participant,
+  })
+)
+
+(define-read-only (get-protocol-balance)
+  (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-market-statistics (market-id uint))
+  (match (map-get? prediction-markets market-id)
+    market-data (some {
+      total-volume: (+ (get bull-pool market-data) (get bear-pool market-data)),
+      bull-percentage: (if (> (+ (get bull-pool market-data) (get bear-pool market-data)) u0)
+        (/ (* (get bull-pool market-data) u100)
+          (+ (get bull-pool market-data) (get bear-pool market-data))
+        )
+        u0
+      ),
+      bear-percentage: (if (> (+ (get bull-pool market-data) (get bear-pool market-data)) u0)
+        (/ (* (get bear-pool market-data) u100)
+          (+ (get bull-pool market-data) (get bear-pool market-data))
+        )
+        u0
+      ),
+    })
+    none
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+(define-public (update-oracle-address (new-oracle principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set oracle-address new-oracle)
+    (ok true)
+  )
+)
+
+(define-public (update-minimum-stake (new-minimum uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-minimum u0) ERR_INVALID_PARAMETER)
+    (var-set minimum-stake new-minimum)
+    (ok true)
+  )
+)
+
+(define-public (update-platform-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-rate u1000) ERR_INVALID_PARAMETER) ;; Max 10%
+    (var-set platform-fee-rate new-fee-rate)
+    (ok true)
+  )
+)
+
+(define-public (withdraw-protocol-fees (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= amount (stx-get-balance (as-contract tx-sender)))
+      ERR_INSUFFICIENT_BALANCE
+    )
+    (try! (as-contract (stx-transfer? amount (as-contract tx-sender) CONTRACT_OWNER)))
+    (ok amount)
+  )
+)
