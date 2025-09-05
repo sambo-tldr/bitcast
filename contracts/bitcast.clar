@@ -93,3 +93,106 @@
     (ok new-market-id)
   )
 )
+
+;; Allows users to stake STX on Bitcoin price direction
+(define-public (cast-prediction
+    (market-id uint)
+    (direction (string-ascii 4))
+    (stake-amount uint)
+  )
+  (let (
+      (market-data (unwrap! (map-get? prediction-markets market-id) ERR_NOT_FOUND))
+      (current-height stacks-block-height)
+    )
+    ;; Validate market timing and parameters
+    (asserts!
+      (and
+        (>= current-height (get market-start market-data))
+        (< current-height (get market-end market-data))
+      )
+      ERR_MARKET_INACTIVE
+    )
+    (asserts! (or (is-eq direction "bull") (is-eq direction "bear"))
+      ERR_INVALID_PREDICTION
+    )
+    (asserts! (>= stake-amount (var-get minimum-stake)) ERR_INVALID_PARAMETER)
+    (asserts! (<= stake-amount (stx-get-balance tx-sender))
+      ERR_INSUFFICIENT_BALANCE
+    )
+
+    ;; Transfer stake to protocol
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+
+    ;; Record participant stake
+    (map-set participant-stakes {
+      market-id: market-id,
+      participant: tx-sender,
+    } {
+      price-direction: direction,
+      stake-amount: stake-amount,
+      rewards-claimed: false,
+    })
+
+    ;; Update market pools
+    (map-set prediction-markets market-id
+      (merge market-data {
+        bull-pool: (if (is-eq direction "bull")
+          (+ (get bull-pool market-data) stake-amount)
+          (get bull-pool market-data)
+        ),
+        bear-pool: (if (is-eq direction "bear")
+          (+ (get bear-pool market-data) stake-amount)
+          (get bear-pool market-data)
+        ),
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;; Oracle resolves market with final Bitcoin price
+(define-public (settle-market
+    (market-id uint)
+    (closing-price uint)
+  )
+  (let ((market-data (unwrap! (map-get? prediction-markets market-id) ERR_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (var-get oracle-address)) ERR_UNAUTHORIZED)
+    (asserts! (>= stacks-block-height (get market-end market-data))
+      ERR_MARKET_INACTIVE
+    )
+    (asserts! (not (get is-resolved market-data)) ERR_MARKET_INACTIVE)
+    (asserts! (> closing-price u0) ERR_INVALID_PARAMETER)
+
+    (map-set prediction-markets market-id
+      (merge market-data {
+        final-price: closing-price,
+        is-resolved: true,
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;; Participants claim rewards from successful predictions
+(define-public (claim-prediction-rewards (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? prediction-markets market-id) ERR_NOT_FOUND))
+      (stake-data (unwrap!
+        (map-get? participant-stakes {
+          market-id: market-id,
+          participant: tx-sender,
+        })
+        ERR_NOT_FOUND
+      ))
+    )
+    (asserts! (get is-resolved market-data) ERR_MARKET_NOT_RESOLVED)
+    (asserts! (not (get rewards-claimed stake-data)) ERR_ALREADY_CLAIMED)
+
+    (let (
+        (price-increased (> (get final-price market-data) (get initial-price market-data)))
+        (winning-direction (if price-increased
+          "bull"
+          "bear"
+        ))
